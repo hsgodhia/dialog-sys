@@ -1,12 +1,9 @@
-import os, torch, numpy as np, pdb, pickle, copy
+import torch, pickle, copy
 from torch.utils.data import Dataset, DataLoader
-from torchvision import transforms, utils
-from PIL import Image
 import torch.nn as nn
 import torch.nn.init as init
 import torch.optim as optim
 from torch.autograd import Variable
-from torch.optim import lr_scheduler
 
 
 def cmp_dialog(d1, d2):
@@ -71,6 +68,7 @@ class MovieTriples(Dataset):
             tok, f, _, _ = x
             self.dict[tok] = f
             self.inv_dict[f] = tok
+        print("Vocab size:", len(self.inv_dict))
 
     def __len__(self):
         return len(self.utterance_data)
@@ -81,20 +79,83 @@ class MovieTriples(Dataset):
 
 # encode each sentence utterance into a single vector
 class BaseEncoder(nn.Module):
-    def __init__(self):
-        self.rnn = nn.GRU(hidden_size=1000, num_layers=1, bidirectional=False, batch_first=True)
+    def __init__(self, vocab_size, emb_size, hid_size, num_lyr, bidi):
+        super(BaseEncoder, self).__init__()
+        self.hid_size = hid_size
+        self.num_lyr = num_lyr
+        self.direction = 2 if bidi else 1
+        # by default they requires grad is true
+        self.embed = nn.Embedding(vocab_size, emb_size)
+        self.rnn = nn.GRU(dropout=0.2, bias=False, input_size=emb_size, hidden_size=hid_size,
+                          num_layers=num_lyr, bidirectional=bidi, batch_first=True)
+
+    def forward(self, inp_batches):
+        # here input is a list of batches that are of the same size so no padding needed
+        output = []
+        for x in inp_batches:
+            h_0 = Variable(torch.zeros(self.direction*self.num_lyr, x.size(0), self.hid_size))
+            x_emb = self.embed(x)
+            _, x_hid = self.rnn(x_emb, h_0)
+            # move the batch to the front of the tensor
+            x_hid = x_hid.view(x.size(0), -1, self.hid_size)
+            output.append(x_hid)
+        output = torch.cat(output, 0)
+        return output
 
 
 # encode the hidden states of a number of utterances
 class SessionEncoder(nn.Module):
-    def __init__(self):
-        self.rnn = nn.GRU(hidden_size=1500, num_layers=1, bidirectional=False, batch_first=True)
+    def __init__(self, hid_size, inp_size, num_lyr, bidi):
+        super(SessionEncoder, self).__init__()
+        self.hid_size = hid_size
+        self.num_lyr = num_lyr
+        self.direction = 2 if bidi else 1
+        self.rnn = nn.GRU(dropout=0.2, hidden_size=hid_size, input_size=inp_size,
+                          num_layers=num_lyr, bidirectional=bidi, batch_first=True)
+
+    def forward(self, x):
+        h_0 = Variable(torch.zeros(self.direction * self.num_lyr, x.size(0), self.hid_size))
+        _, o = self.rnn(x, h_0)
+        # move the batch to the front of the tensor
+        o = o.view(x.size(0), -1, self.hid_size)
+        return o
 
 
 # decode the hidden state
 class Decoder(nn.Module):
-    def __init__(self):
-        self.rnn = nn.GRU(hidden_size=1000, num_layers=1, bidirectional=False, batch_first=True)
+    def __init__(self, vocab_size, emb_size, ses_hid_size, hid_size, num_lyr, bidi):
+        super(Decoder, self).__init__()
+        self.hid_size = hid_size
+        self.num_lyr = num_lyr
+        self.embed = nn.Embedding(vocab_size, emb_size) # currently the output embedding doesn't share weight
+        self.direction = 2 if bidi else 1
+        self.lin1 = nn.Linear(ses_hid_size, hid_size)
+        self.tanh = nn.Tanh()
+        self.rnn = nn.GRU(dropout=0.2, hidden_size=hid_size, input_size=emb_size,
+                          num_layers=num_lyr, bidirectional=False, batch_first=True)
+        self.lin2 = nn.Linear(hid_size, vocab_size)
+
+    def forward(self, inp_batches, ses_encoding):
+        ses_encoding = self.tanh(self.lin1(ses_encoding))
+        outputs = []
+        c_siz = 0
+        for x in inp_batches:
+            siz = x.size(0)
+            x_emb = self.embed(x)
+            sub_ses_encoding = ses_encoding[c_siz: (c_siz + siz), :, :]
+            sub_ses_encoding = sub_ses_encoding.view(self.num_lyr*self.direction, siz, self.hid_size)
+            # I'm directly doing teacher forcing here by feeding the true sequence via embedding layer
+            _, dec_o = self.rnn(x_emb, sub_ses_encoding)
+
+            # move the batch to the front of the tensor
+            dec_o = dec_o.view(x.size(0), -1, self.hid_size)
+            outputs.append(dec_o)
+            c_siz += siz
+
+        outputs = torch.cat(outputs, 0)
+        outputs = self.lin2(outputs)
+
+        return outputs
 
 
 def custom_collate_fn(batch):
@@ -103,48 +164,63 @@ def custom_collate_fn(batch):
     for d in batch:
         if len(d.u1) != l_u1:
             if len(cur_batch) > 0:
-                u1_batch.append(torch.stack(cur_batch, 0))
+                u1_batch.append(Variable(torch.stack(cur_batch, 0)))
                 cur_batch[:] = []
 
         l_u1 = len(d.u1)
         cur_batch.append(torch.LongTensor(d.u1))
     if len(cur_batch) > 0:
-        u1_batch.append(torch.stack(cur_batch, 0))
+        u1_batch.append(Variable(torch.stack(cur_batch, 0)))
     cur_batch[:] = []
 
     for d in batch:
         if len(d.u2) != l_u2:
             if len(cur_batch) > 0:
-                u2_batch.append(torch.stack(cur_batch, 0))
+                u2_batch.append(Variable(torch.stack(cur_batch, 0)))
                 cur_batch[:] = []
 
         l_u2 = len(d.u2)
         cur_batch.append(torch.LongTensor(d.u2))
 
     if len(cur_batch) > 0:
-        u2_batch.append(torch.stack(cur_batch, 0))
+        u2_batch.append(Variable(torch.stack(cur_batch, 0)))
     cur_batch[:] = []
 
     for d in batch:
         if len(d.u3) != l_u3:
             if len(cur_batch) > 0:
-                u3_batch.append(torch.stack(cur_batch, 0))
+                u3_batch.append(Variable(torch.stack(cur_batch, 0)))
                 cur_batch[:] = []
 
         l_u3 = len(d.u3)
         cur_batch.append(torch.LongTensor(d.u3))
 
     if len(cur_batch) > 0:
-        u3_batch.append(torch.stack(cur_batch, 0))
+        u3_batch.append(Variable(torch.stack(cur_batch, 0)))
 
     return u1_batch, u2_batch, u3_batch
 
 
 def main():
+    base_enc = BaseEncoder(10003, 300, 1000, 1, False)
+    ses_enc = SessionEncoder(1500, 1000, 1, False)
+    dec = Decoder(10003, 300, 1500, 1000, 1, False)
+
     BATCH_SIZE, train_dataset = 20, MovieTriples(data_type='train')
-    train_dataloader = DataLoader(train_dataset, batch_size=BATCH_SIZE, shuffle=False, num_workers=2, collate_fn=custom_collate_fn)
+    train_dataloader = DataLoader(train_dataset, batch_size=BATCH_SIZE, shuffle=False, num_workers=2,
+                                  collate_fn=custom_collate_fn)
     for i_batch, sample_batch in enumerate(train_dataloader):
-        print(sample_batch[0])
+        u1, u2, u3 = sample_batch[0], sample_batch[1], sample_batch[2]
+        o1, o2 = base_enc(u1), base_enc(u2)
+        print(o1.size())
+        qu_seq = torch.cat((o1, o2), 1)
+
+        # if we need to decode the intermediate queries we may need the hidden states
+        final_session_o = ses_enc(qu_seq)
+        print(final_session_o.size())
+
+        dec_o = dec(u3, final_session_o)
+        print(dec_o.size())
         break
         # 1 * 33 dimensional input
 
