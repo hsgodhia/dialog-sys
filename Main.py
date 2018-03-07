@@ -134,28 +134,37 @@ class Decoder(nn.Module):
         self.rnn = nn.GRU(dropout=0.2, hidden_size=hid_size, input_size=emb_size,
                           num_layers=num_lyr, bidirectional=False, batch_first=True)
         self.lin2 = nn.Linear(hid_size, vocab_size)
+        self.log_soft = nn.LogSoftmax(dim=2)
+        self.loss_cri = nn.NLLLoss()
 
     def forward(self, inp_batches, ses_encoding):
+        # would have to do NLL loss here itself
         ses_encoding = self.tanh(self.lin1(ses_encoding))
-        outputs = []
-        c_siz = 0
+
+        c_siz, loss = 0, 0
         for x in inp_batches:
-            siz = x.size(0)
+            siz, seq_len = x.size(0), x.size(1)
             x_emb = self.embed(x)
+
             sub_ses_encoding = ses_encoding[c_siz: (c_siz + siz), :, :]
             sub_ses_encoding = sub_ses_encoding.view(self.num_lyr*self.direction, siz, self.hid_size)
             # I'm directly doing teacher forcing here by feeding the true sequence via embedding layer
-            _, dec_o = self.rnn(x_emb, sub_ses_encoding)
+            dec_ts, dec_o = self.rnn(x_emb, sub_ses_encoding)
+            # dec_ts is of size (seq_len, batch, hidden_size * num_directions)
 
             # move the batch to the front of the tensor
-            dec_o = dec_o.view(x.size(0), -1, self.hid_size)
-            outputs.append(dec_o)
+            dec_ts = dec_ts.contiguous().view(siz, seq_len, -1)
+            # got a input is not contiguous error above
+            dec_ts = self.lin2(dec_ts)
+            dec_ts = self.log_soft(dec_ts)
+
+            # here the dimension is N*SEQ_LEN*VOCAB_SIZE
+            for i in range(seq_len):
+                loss += self.loss_cri(dec_ts[:, i, :], x[:, i])
+
             c_siz += siz
 
-        outputs = torch.cat(outputs, 0)
-        outputs = self.lin2(outputs)
-
-        return outputs
+        return loss
 
 
 def custom_collate_fn(batch):
@@ -205,7 +214,7 @@ def main():
     base_enc = BaseEncoder(10003, 300, 1000, 1, False)
     ses_enc = SessionEncoder(1500, 1000, 1, False)
     dec = Decoder(10003, 300, 1500, 1000, 1, False)
-
+    optimizer = torch.optim.RMSprop(params=(list(base_enc.parameters()) + list(ses_enc.parameters()) + list(dec.parameters())))
     BATCH_SIZE, train_dataset = 20, MovieTriples(data_type='train')
     train_dataloader = DataLoader(train_dataset, batch_size=BATCH_SIZE, shuffle=False, num_workers=2,
                                   collate_fn=custom_collate_fn)
@@ -219,8 +228,13 @@ def main():
         final_session_o = ses_enc(qu_seq)
         print(final_session_o.size())
 
-        dec_o = dec(u3, final_session_o)
-        print(dec_o.size())
+        loss = dec(u3, final_session_o)
+        print(loss.data[0])
+
+        optimizer.zero_grad()
+        loss.backward()
+        optimizer.step()
+        
         break
         # 1 * 33 dimensional input
 
