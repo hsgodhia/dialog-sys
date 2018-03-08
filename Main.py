@@ -1,4 +1,4 @@
-import torch, pickle, copy
+import torch, pickle, copy, argparse, time
 from torch.utils.data import Dataset, DataLoader
 import torch.nn as nn
 import torch.nn.init as init
@@ -6,6 +6,7 @@ import torch.optim as optim
 from torch.autograd import Variable
 
 use_cuda = torch.cuda.is_available()
+print("cuda is: ", use_cuda)
 
 
 def cmp_dialog(d1, d2):
@@ -200,7 +201,11 @@ def custom_collate_fn(batch):
                 cur_batch[:] = []
 
         l_u1 = len(d.u1)
-        cur_batch.append(torch.LongTensor(d.u1))
+        if use_cuda:
+            cur_batch.append(torch.cuda.LongTensor(d.u1))
+        else:
+            cur_batch.append(torch.LongTensor(d.u1))
+
     if len(cur_batch) > 0:
         u1_batch.append(Variable(torch.stack(cur_batch, 0)))
     cur_batch[:] = []
@@ -212,7 +217,10 @@ def custom_collate_fn(batch):
                 cur_batch[:] = []
 
         l_u2 = len(d.u2)
-        cur_batch.append(torch.LongTensor(d.u2))
+        if use_cuda:
+            cur_batch.append(torch.cuda.LongTensor(d.u2))
+        else:
+            cur_batch.append(torch.LongTensor(d.u2))
 
     if len(cur_batch) > 0:
         u2_batch.append(Variable(torch.stack(cur_batch, 0)))
@@ -225,7 +233,10 @@ def custom_collate_fn(batch):
                 cur_batch[:] = []
 
         l_u3 = len(d.u3)
-        cur_batch.append(torch.LongTensor(d.u3))
+        if use_cuda:
+            cur_batch.append(torch.cuda.LongTensor(d.u3))
+        else:
+            cur_batch.append(torch.LongTensor(d.u3))
 
     if len(cur_batch) > 0:
         u3_batch.append(Variable(torch.stack(cur_batch, 0)))
@@ -251,40 +262,70 @@ def calc_valid_loss(base_enc, ses_enc, dec):
         final_session_o = ses_enc(qu_seq)
         loss = dec(u3, final_session_o)
         valid_loss += loss.data[0]
-        print(valid_loss)
 
-    print("Valid loss", valid_loss/i_batch)
+    return valid_loss/i_batch
 
 
-def main():
-    base_enc = BaseEncoder(10003, 300, 1000, 1, False)
-    ses_enc = SessionEncoder(1500, 1000, 1, False)
-    dec = Decoder(10003, 300, 1500, 1000, 1, False, True)
-    optimizer = optim.RMSprop(params=(list(base_enc.parameters()) + list(ses_enc.parameters()) + list(dec.parameters())))
+def train(options, base_enc, ses_enc, dec):
+    base_enc.train()
+    ses_enc.train()
+    dec.train()
+
+    all_params = list(base_enc.parameters()) + list(ses_enc.parameters()) + list(dec.parameters())
+    # init parameters
+    for name, param in base_enc.named_parameters():
+        if name.startswith('rnn') and len(param.size()) >= 2:
+            init.orthogonal(param)
+        else:
+            init.normal(param, 0, 0.01)
+
     bt_siz, train_dataset = 32, MovieTriples(data_type='train')
     train_dataloader = DataLoader(train_dataset, batch_size=bt_siz, shuffle=False, num_workers=2,
                                   collate_fn=custom_collate_fn)
-    for i_batch, sample_batch in enumerate(train_dataloader):
-        u1, u2, u3 = sample_batch[0], sample_batch[1], sample_batch[2]
-        o1, o2 = base_enc(u1), base_enc(u2)
-        print('o1 size', o1.size())
-        qu_seq = torch.cat((o1, o2), 1)
+    optimizer = optim.Adam(all_params)
 
-        # if we need to decode the intermediate queries we may need the hidden states
-        final_session_o = ses_enc(qu_seq)
-        print('session size', final_session_o.size())
+    for i in range(options.e):
+        tr_loss = 0
+        strt = time.time()
+        for i_batch, sample_batch in enumerate(train_dataloader):
+            u1, u2, u3 = sample_batch[0], sample_batch[1], sample_batch[2]
+            o1, o2 = base_enc(u1), base_enc(u2)
+            qu_seq = torch.cat((o1, o2), 1)
 
-        loss = dec(u3, final_session_o)
-        print('loss', loss.data[0])
+            # if we need to decode the intermediate queries we may need the hidden states
+            final_session_o = ses_enc(qu_seq)
 
-        optimizer.zero_grad()
-        loss.backward()
-        optimizer.step()
+            loss = dec(u3, final_session_o)
+            tr_loss += loss.data[0]
 
-        break
-        # 1 * 33 dimensional input
+            optimizer.zero_grad()
+            loss.backward()
+            optimizer.step()
 
-    calc_valid_loss(base_enc, ses_enc, dec)
+        vl_loss = calc_valid_loss(base_enc, ses_enc, dec)
+        print("Valid loss", vl_loss)
+        print("Training loss", tr_loss/i_batch)
+        print("epoch took", (time.time() - strt)/3600.0)
+        if i_batch%2 == 0:
+            torch.save(base_enc.state_dict(), 'enc_mdl.pth')
+            torch.save(ses_enc.state_dict(), 'ses_mdl.pth')
+            torch.save(dec.state_dict(), 'dec_mdl.pth')
+            torch.save(optimizer.state_dict(), 'opti_st.pth')
+
+
+def main():
+    parser = argparse.ArgumentParser(description='HRED parameter options')
+    parser.add_argument('-e', dest='e', type=int, default=10, help='number of epochs')
+    options = parser.parse_args()
+
+    base_enc = BaseEncoder(10003, 300, 1000, 1, False)
+    ses_enc = SessionEncoder(1500, 1000, 1, False)
+    dec = Decoder(10003, 300, 1500, 1000, 1, False, True)
+    if use_cuda:
+        base_enc.cuda()
+        ses_enc.cuda()
+        dec.cuda()
+    train(options, base_enc, ses_enc, dec)
 
 
 main()
