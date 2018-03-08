@@ -5,6 +5,8 @@ import torch.nn.init as init
 import torch.optim as optim
 from torch.autograd import Variable
 
+use_cuda = torch.cuda.is_available()
+
 
 def cmp_dialog(d1, d2):
     if len(d1) < len(d2):
@@ -98,6 +100,7 @@ class BaseEncoder(nn.Module):
             _, x_hid = self.rnn(x_emb, h_0)
             # move the batch to the front of the tensor
             x_hid = x_hid.view(x.size(0), -1, self.hid_size)
+
             output.append(x_hid)
         output = torch.cat(output, 0)
         return output
@@ -115,6 +118,7 @@ class SessionEncoder(nn.Module):
 
     def forward(self, x):
         h_0 = Variable(torch.zeros(self.direction * self.num_lyr, x.size(0), self.hid_size))
+        # output, h_n for output batch is already dim 0
         _, o = self.rnn(x, h_0)
         # move the batch to the front of the tensor
         o = o.view(x.size(0), -1, self.hid_size)
@@ -123,7 +127,7 @@ class SessionEncoder(nn.Module):
 
 # decode the hidden state
 class Decoder(nn.Module):
-    def __init__(self, vocab_size, emb_size, ses_hid_size, hid_size, num_lyr, bidi):
+    def __init__(self, vocab_size, emb_size, ses_hid_size, hid_size, num_lyr=1, bidi=False, teacher=True):
         super(Decoder, self).__init__()
         self.hid_size = hid_size
         self.num_lyr = num_lyr
@@ -136,6 +140,7 @@ class Decoder(nn.Module):
         self.lin2 = nn.Linear(hid_size, vocab_size)
         self.log_soft = nn.LogSoftmax(dim=2)
         self.loss_cri = nn.NLLLoss()
+        self.teacher_forcing = teacher
 
     def forward(self, inp_batches, ses_encoding):
         # would have to do NLL loss here itself
@@ -148,23 +153,41 @@ class Decoder(nn.Module):
 
             sub_ses_encoding = ses_encoding[c_siz: (c_siz + siz), :, :]
             sub_ses_encoding = sub_ses_encoding.view(self.num_lyr*self.direction, siz, self.hid_size)
-            # I'm directly doing teacher forcing here by feeding the true sequence via embedding layer
-            dec_ts, dec_o = self.rnn(x_emb, sub_ses_encoding)
-            # dec_ts is of size (seq_len, batch, hidden_size * num_directions)
 
-            # move the batch to the front of the tensor
-            dec_ts = dec_ts.contiguous().view(siz, seq_len, -1)
-            # got a input is not contiguous error above
-            dec_ts = self.lin2(dec_ts)
-            dec_ts = self.log_soft(dec_ts)
+            if not self.teacher_forcing:
+                # start of sentence is the first tok
+                tok = x_emb[:, 0, :]
+                tok = tok.unsqueeze(1)
+                hid_n = sub_ses_encoding
 
-            # here the dimension is N*SEQ_LEN*VOCAB_SIZE
-            for i in range(seq_len):
-                loss += self.loss_cri(dec_ts[:, i, :], x[:, i])
+                for i in range(seq_len):
+                    hid_n, _ = self.rnn(tok, hid_n)
+                    op = self.lin2(hid_n)
+                    op = self.log_soft(op)
+                    op = op.squeeze(1)
+                    if i+1 < seq_len:
+                        loss += self.loss_cri(op, x[:, i+1])
+                        _, tok = torch.max(op, dim=1, keepdim=True)
+                        tok = self.embed(tok)
+            else:
+                # I'm directly doing teacher forcing here by feeding the true sequence via embedding layer
+                dec_ts, dec_o = self.rnn(x_emb, sub_ses_encoding)
+                # dec_ts is of size (batch, seq_len, hidden_size * num_directions)
+
+                # got a input is not contiguous error above
+                dec_ts = self.lin2(dec_ts)
+                dec_ts = self.log_soft(dec_ts)
+
+                # here the dimension is N*SEQ_LEN*VOCAB_SIZE
+                for i in range(seq_len):
+                    loss += self.loss_cri(dec_ts[:, i, :], x[:, i])
 
             c_siz += siz
 
         return loss
+
+    def set_teacher_forcing(self, val):
+        self.teacher_forcing = val
 
 
 def custom_collate_fn(batch):
@@ -210,32 +233,58 @@ def custom_collate_fn(batch):
     return u1_batch, u2_batch, u3_batch
 
 
+def calc_valid_loss(base_enc, ses_enc, dec):
+    base_enc.eval()
+    ses_enc.eval()
+    dec.eval()
+    dec.set_teacher_forcing(False)
+
+    bt_siz, valid_dataset = 32, MovieTriples(data_type='valid')
+    valid_dataloader = DataLoader(valid_dataset, batch_size=bt_siz, shuffle=False, num_workers=2,
+                                  collate_fn=custom_collate_fn)
+
+    valid_loss = 0
+    for i_batch, sample_batch in enumerate(valid_dataloader):
+        u1, u2, u3 = sample_batch[0], sample_batch[1], sample_batch[2]
+        o1, o2 = base_enc(u1), base_enc(u2)
+        qu_seq = torch.cat((o1, o2), 1)
+        final_session_o = ses_enc(qu_seq)
+        loss = dec(u3, final_session_o)
+        valid_loss += loss.data[0]
+        print(valid_loss)
+
+    print("Valid loss", valid_loss/i_batch)
+
+
 def main():
     base_enc = BaseEncoder(10003, 300, 1000, 1, False)
     ses_enc = SessionEncoder(1500, 1000, 1, False)
-    dec = Decoder(10003, 300, 1500, 1000, 1, False)
-    optimizer = torch.optim.RMSprop(params=(list(base_enc.parameters()) + list(ses_enc.parameters()) + list(dec.parameters())))
-    BATCH_SIZE, train_dataset = 20, MovieTriples(data_type='train')
-    train_dataloader = DataLoader(train_dataset, batch_size=BATCH_SIZE, shuffle=False, num_workers=2,
+    dec = Decoder(10003, 300, 1500, 1000, 1, False, True)
+    optimizer = optim.RMSprop(params=(list(base_enc.parameters()) + list(ses_enc.parameters()) + list(dec.parameters())))
+    bt_siz, train_dataset = 32, MovieTriples(data_type='train')
+    train_dataloader = DataLoader(train_dataset, batch_size=bt_siz, shuffle=False, num_workers=2,
                                   collate_fn=custom_collate_fn)
     for i_batch, sample_batch in enumerate(train_dataloader):
         u1, u2, u3 = sample_batch[0], sample_batch[1], sample_batch[2]
         o1, o2 = base_enc(u1), base_enc(u2)
-        print(o1.size())
+        print('o1 size', o1.size())
         qu_seq = torch.cat((o1, o2), 1)
 
         # if we need to decode the intermediate queries we may need the hidden states
         final_session_o = ses_enc(qu_seq)
-        print(final_session_o.size())
+        print('session size', final_session_o.size())
 
         loss = dec(u3, final_session_o)
-        print(loss.data[0])
+        print('loss', loss.data[0])
 
         optimizer.zero_grad()
         loss.backward()
         optimizer.step()
-        
+
         break
         # 1 * 33 dimensional input
+
+    calc_valid_loss(base_enc, ses_enc, dec)
+
 
 main()
