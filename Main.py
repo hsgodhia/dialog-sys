@@ -6,7 +6,9 @@ import torch.optim as optim
 from torch.autograd import Variable
 
 use_cuda = torch.cuda.is_available()
-print("cuda is: ", use_cuda)
+torch.manual_seed(123)
+if use_cuda:
+    torch.cuda.manual_seed(123)
 
 
 def cmp_dialog(d1, d2):
@@ -44,8 +46,6 @@ class DialogTurn():
 
 class MovieTriples(Dataset):
     def __init__(self, data_type):
-        # we use a common dict for all test, train and validation
-        _dict_file = '/home/harshal/code/research/untitled/data/MovieTriples_Dataset/Training.dict.pkl'
 
         if data_type == 'train':
             _file = '/home/harshal/code/research/untitled/data/MovieTriples_Dataset/Training.triples.pkl'
@@ -60,18 +60,6 @@ class MovieTriples(Dataset):
             for d in data:
                 self.utterance_data.append(DialogTurn(d))
         self.utterance_data.sort(cmp=cmp_dialog)
-        with open(_dict_file, 'rb') as fp2:
-            self.dict_data = pickle.load(fp2)
-        # dictionary data is like ('</s>', 2, 588827, 785135)
-        # so i believe that the first is the ids are assigned by frequency
-        # thinking to use a counter collection out here maybe
-        self.inv_dict = {}
-        self.dict = {}
-        for x in self.dict_data:
-            tok, f, _, _ = x
-            self.dict[tok] = f
-            self.inv_dict[f] = tok
-        print("Vocab size:", len(self.inv_dict))
 
     def __len__(self):
         return len(self.utterance_data)
@@ -96,7 +84,11 @@ class BaseEncoder(nn.Module):
         # here input is a list of batches that are of the same size so no padding needed
         output = []
         for x in inp_batches:
-            h_0 = Variable(torch.zeros(self.direction*self.num_lyr, x.size(0), self.hid_size))
+            h_0 = Variable(torch.zeros(self.direction * self.num_lyr, x.size(0), self.hid_size))
+            if use_cuda:
+                x = x.cuda()
+                h_0 = h_0.cuda()
+
             x_emb = self.embed(x)
             _, x_hid = self.rnn(x_emb, h_0)
             # move the batch to the front of the tensor
@@ -119,6 +111,9 @@ class SessionEncoder(nn.Module):
 
     def forward(self, x):
         h_0 = Variable(torch.zeros(self.direction * self.num_lyr, x.size(0), self.hid_size))
+        if use_cuda:
+            h_0 = h_0.cuda()
+
         # output, h_n for output batch is already dim 0
         _, o = self.rnn(x, h_0)
         # move the batch to the front of the tensor
@@ -143,49 +138,84 @@ class Decoder(nn.Module):
         self.loss_cri = nn.NLLLoss()
         self.teacher_forcing = teacher
 
-    def forward(self, inp_batches, ses_encoding):
-        # would have to do NLL loss here itself
-        ses_encoding = self.tanh(self.lin1(ses_encoding))
+    def forward(self, ses_encoding, inp_batches=None):
+        # this indicates inference mode
+        if inp_batches is None:
+            # todo assume batch size 1 for this method
+            # we use this for inference when the only input is the ses_encoding
+            ses_encoding = self.tanh(self.lin1(ses_encoding))
+            siz = ses_encoding.size(0)
+            # in each iteration the generated sentence's length increases by 1 so loop terminates
+            gen_len, sent, hid_n = 0, [], ses_encoding
+            # the start token has index 1
 
-        c_siz, loss = 0, 0
-        for x in inp_batches:
-            siz, seq_len = x.size(0), x.size(1)
-            x_emb = self.embed(x)
+            tok = Variable(torch.ones(siz, 1).long())
+            sent.append(tok.data[0, 0])
+            if use_cuda:
+                tok = tok.cuda()
 
-            sub_ses_encoding = ses_encoding[c_siz: (c_siz + siz), :, :]
-            sub_ses_encoding = sub_ses_encoding.view(self.num_lyr*self.direction, siz, self.hid_size)
+            while True:
+                if gen_len > 50 or tok.data[0, 0] == 2:
+                    break
+                tok_vec = self.embed(tok)
+                hid_n, _ = self.rnn(tok_vec, hid_n)
+                op = self.lin2(hid_n)
+                op = self.log_soft(op)
+                op = op.squeeze(1)
+                tok_val, tok = torch.max(op, dim=1, keepdim=True)
+                sent.append(tok.data[0, 0])
+                gen_len += 1
 
-            if not self.teacher_forcing:
-                # start of sentence is the first tok
-                tok = x_emb[:, 0, :]
-                tok = tok.unsqueeze(1)
-                hid_n = sub_ses_encoding
+            return sent
 
-                for i in range(seq_len):
-                    hid_n, _ = self.rnn(tok, hid_n)
-                    op = self.lin2(hid_n)
-                    op = self.log_soft(op)
-                    op = op.squeeze(1)
-                    if i+1 < seq_len:
-                        loss += self.loss_cri(op, x[:, i+1])
-                        _, tok = torch.max(op, dim=1, keepdim=True)
-                        tok = self.embed(tok)
-            else:
-                # I'm directly doing teacher forcing here by feeding the true sequence via embedding layer
-                dec_ts, dec_o = self.rnn(x_emb, sub_ses_encoding)
-                # dec_ts is of size (batch, seq_len, hidden_size * num_directions)
+        else:
+            # would have to do NLL loss here itself
+            ses_encoding = self.tanh(self.lin1(ses_encoding))
 
-                # got a input is not contiguous error above
-                dec_ts = self.lin2(dec_ts)
-                dec_ts = self.log_soft(dec_ts)
+            c_siz, loss = 0, 0
+            for x in inp_batches:
+                if use_cuda:
+                    x = x.cuda()
+                siz, seq_len = x.size(0), x.size(1)
+                x_emb = self.embed(x)
 
-                # here the dimension is N*SEQ_LEN*VOCAB_SIZE
-                for i in range(seq_len):
-                    loss += self.loss_cri(dec_ts[:, i, :], x[:, i])
+                sub_ses_encoding = ses_encoding[c_siz: (c_siz + siz), :, :]
+                sub_ses_encoding = sub_ses_encoding.view(self.num_lyr*self.direction, siz, self.hid_size)
 
-            c_siz += siz
+                if not self.teacher_forcing:
+                    # start of sentence is the first tok
+                    tok = x_emb[:, 0, :]
+                    tok = tok.unsqueeze(1)
+                    hid_n = sub_ses_encoding
 
-        return loss
+                    for i in range(seq_len):
+                        hid_o, hid_n = self.rnn(tok, hid_n)
+                        # hid_o (seq_len, batch, hidden_size * num_directions) batch first affects this
+                        # hid_n (num_layers * num_directions, batch, hidden_size)  batch first doesn't affect
+                        # h_0 (num_layers * num_directions, batch, hidden_size) batch first doesn't affect
+                        op = self.lin2(hid_o)
+                        op = self.log_soft(op)
+                        op = op.squeeze(1)
+                        if i+1 < seq_len:
+                            loss += self.loss_cri(op, x[:, i+1])
+                            _, tok = torch.max(op, dim=1, keepdim=True)
+                            tok = self.embed(tok)
+                else:
+                    # I'm directly doing teacher forcing here by feeding the true sequence via embedding layer
+                    dec_ts, dec_o = self.rnn(x_emb, sub_ses_encoding)
+                    # dec_ts is of size (batch, seq_len, hidden_size * num_directions)
+
+                    # got a input is not contiguous error above
+                    dec_ts = self.lin2(dec_ts)
+                    dec_ts = self.log_soft(dec_ts)
+
+                    # here the dimension is N*SEQ_LEN*VOCAB_SIZE
+                    for i in range(seq_len):
+                        loss += self.loss_cri(dec_ts[:, i, :], x[:, i])
+
+                c_siz += siz
+
+            return loss
 
     def set_teacher_forcing(self, val):
         self.teacher_forcing = val
@@ -201,10 +231,7 @@ def custom_collate_fn(batch):
                 cur_batch[:] = []
 
         l_u1 = len(d.u1)
-        if use_cuda:
-            cur_batch.append(torch.cuda.LongTensor(d.u1))
-        else:
-            cur_batch.append(torch.LongTensor(d.u1))
+        cur_batch.append(torch.LongTensor(d.u1))
 
     if len(cur_batch) > 0:
         u1_batch.append(Variable(torch.stack(cur_batch, 0)))
@@ -217,10 +244,7 @@ def custom_collate_fn(batch):
                 cur_batch[:] = []
 
         l_u2 = len(d.u2)
-        if use_cuda:
-            cur_batch.append(torch.cuda.LongTensor(d.u2))
-        else:
-            cur_batch.append(torch.LongTensor(d.u2))
+        cur_batch.append(torch.LongTensor(d.u2))
 
     if len(cur_batch) > 0:
         u2_batch.append(Variable(torch.stack(cur_batch, 0)))
@@ -233,10 +257,7 @@ def custom_collate_fn(batch):
                 cur_batch[:] = []
 
         l_u3 = len(d.u3)
-        if use_cuda:
-            cur_batch.append(torch.cuda.LongTensor(d.u3))
-        else:
-            cur_batch.append(torch.LongTensor(d.u3))
+        cur_batch.append(torch.LongTensor(d.u3))
 
     if len(cur_batch) > 0:
         u3_batch.append(Variable(torch.stack(cur_batch, 0)))
@@ -250,7 +271,7 @@ def calc_valid_loss(base_enc, ses_enc, dec):
     dec.eval()
     dec.set_teacher_forcing(False)
 
-    bt_siz, valid_dataset = 32, MovieTriples(data_type='valid')
+    bt_siz, valid_dataset = 32, MovieTriples(data_type='valid')[:32]
     valid_dataloader = DataLoader(valid_dataset, batch_size=bt_siz, shuffle=False, num_workers=2,
                                   collate_fn=custom_collate_fn)
 
@@ -260,10 +281,10 @@ def calc_valid_loss(base_enc, ses_enc, dec):
         o1, o2 = base_enc(u1), base_enc(u2)
         qu_seq = torch.cat((o1, o2), 1)
         final_session_o = ses_enc(qu_seq)
-        loss = dec(u3, final_session_o)
+        loss = dec(final_session_o, u3)
         valid_loss += loss.data[0]
 
-    return valid_loss/i_batch
+    return valid_loss/(1 + i_batch)
 
 
 def train(options, base_enc, ses_enc, dec):
@@ -279,7 +300,7 @@ def train(options, base_enc, ses_enc, dec):
         else:
             init.normal(param, 0, 0.01)
 
-    bt_siz, train_dataset = 32, MovieTriples(data_type='train')
+    bt_siz, train_dataset = 32, MovieTriples(data_type='train')[:32]
     train_dataloader = DataLoader(train_dataset, batch_size=bt_siz, shuffle=False, num_workers=2,
                                   collate_fn=custom_collate_fn)
     optimizer = optim.Adam(all_params)
@@ -295,16 +316,17 @@ def train(options, base_enc, ses_enc, dec):
             # if we need to decode the intermediate queries we may need the hidden states
             final_session_o = ses_enc(qu_seq)
 
-            loss = dec(u3, final_session_o)
+            loss = dec(final_session_o, u3)
             tr_loss += loss.data[0]
 
             optimizer.zero_grad()
             loss.backward()
             optimizer.step()
+            print('done', i_batch)
 
         vl_loss = calc_valid_loss(base_enc, ses_enc, dec)
         print("Valid loss", vl_loss)
-        print("Training loss", tr_loss/i_batch)
+        print("Training loss", tr_loss/(1 + i_batch))
         print("epoch took", (time.time() - strt)/3600.0)
         if i_batch%2 == 0:
             torch.save(base_enc.state_dict(), 'enc_mdl.pth')
@@ -314,18 +336,75 @@ def train(options, base_enc, ses_enc, dec):
 
 
 def main():
+    # we use a common dict for all test, train and validation
+    _dict_file = '/home/harshal/code/research/untitled/data/MovieTriples_Dataset/Training.dict.pkl'
+    with open(_dict_file, 'rb') as fp2:
+        dict_data = pickle.load(fp2)
+    # dictionary data is like ('</s>', 2, 588827, 785135)
+    # so i believe that the first is the ids are assigned by frequency
+    # thinking to use a counter collection out here maybe
+    inv_dict = {}
+    dict = {}
+    for x in dict_data:
+        tok, f, _, _ = x
+        dict[tok] = f
+        inv_dict[f] = tok
+
     parser = argparse.ArgumentParser(description='HRED parameter options')
     parser.add_argument('-e', dest='e', type=int, default=10, help='number of epochs')
     options = parser.parse_args()
 
     base_enc = BaseEncoder(10003, 300, 1000, 1, False)
     ses_enc = SessionEncoder(1500, 1000, 1, False)
-    dec = Decoder(10003, 300, 1500, 1000, 1, False, True)
+    dec = Decoder(10003, 300, 1500, 1000, 1, False, False)
     if use_cuda:
         base_enc.cuda()
         ses_enc.cuda()
         dec.cuda()
+
     train(options, base_enc, ses_enc, dec)
+    # inference_beam(base_enc, ses_enc, dec, inv_dict)
+
+
+def tensor_to_sent(x, inv_dict):
+    sent = []
+    for i in x:
+        sent.append(inv_dict[i])
+
+    return " ".join(sent)
+
+
+# sample a sentence from the test set by using beam search
+# todo currently does greedy modify to do beam
+def inference_beam(base_enc, ses_enc, dec, inv_dict, width=5):
+    saved_state = torch.load("enc_mdl.pth")
+    base_enc.load_state_dict(saved_state)
+
+    saved_state = torch.load("ses_mdl.pth")
+    ses_enc.load_state_dict(saved_state)
+
+    saved_state = torch.load("dec_mdl.pth")
+    dec.load_state_dict(saved_state)
+
+    base_enc.eval()
+    ses_enc.eval()
+    dec.eval()
+
+    # todo not sure how to do inference for batch size > 1
+    bt_siz, test_dataset = 1, MovieTriples(data_type='test')[:10]
+    test_dataloader = DataLoader(test_dataset, batch_size=bt_siz, shuffle=False, num_workers=2,
+                                  collate_fn=custom_collate_fn)
+
+    for i_batch, sample_batch in enumerate(test_dataloader):
+        u1, u2 = sample_batch[0], sample_batch[1]
+        o1, o2 = base_enc(u1), base_enc(u2)
+        qu_seq = torch.cat((o1, o2), 1)
+
+        # if we need to decode the intermediate queries we may need the hidden states
+        final_session_o = ses_enc(qu_seq)
+
+        sent = dec(final_session_o)
+        print(tensor_to_sent(sent, inv_dict))
 
 
 main()
